@@ -18,6 +18,7 @@ app.use(express.urlencoded({ extended: true }));
 const PORT       = parseInt(process.env.PORT || '8080', 10);
 let   ADMIN_USER = process.env.ADMIN_USER || 'admin';
 let   ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
+const REPORT_ID  = process.env.REPORT_ID  || '1';
 
 // — Sessions ——————————————————————————————————
 const sessions = {};
@@ -623,30 +624,28 @@ app.get('/', requireAdmin, (req,res)=>{
 app.get('/admin/new', requireAdmin, (req,res)=>{
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Nouvel utilisateur</title><style>${CSS_COMMON}</style></head>
   <body><div class="wrap"><div class="card"><div class="ch">➕ NOUVEL UTILISATEUR <a href="/" style="margin-left:auto;color:var(--m);font-size:10px">← Retour</a></div>
-  <div class="cb"><form method="POST" action="/admin/new">
+  <div class="cb">
+  ${req.query.err?'<div class="alert a-err">Identifiant déjà utilisé ou champs manquants</div>':''}
+  <p style="color:var(--m);font-size:11px;margin-bottom:16px">L'admin crée l'accès (identifiant + mot de passe). L'utilisateur configurera ensuite lui-même son token et ses cookies depuis son tableau de bord.</p>
+  <form method="POST" action="/admin/new">
   <div class="g2">
-    <div class="frow"><label>Identifiant</label><input name="userId" required></div>
+    <div class="frow"><label>Identifiant</label><input name="userId" required autofocus></div>
     <div class="frow"><label>Mot de passe</label><input type="password" name="password" required></div>
-    <div class="frow"><label>Token Yapson</label><input name="yapToken" required></div>
-    <div class="frow"><label>Report ID (mgmt)</label><input name="reportId" value="1"></div>
-    <div class="frow"><label>Intervalle poll (s)</label><input name="pollInterval" type="number" value="60" min="20"></div>
-    <div class="frow"><label>Auto-démarrer</label><select name="autoStart"><option value="0">Non</option><option value="1">Oui</option></select></div>
   </div>
-  <div class="frow"><label>Cookies my-managment.com</label><textarea name="mgmtCookies" rows="4" placeholder="Collez vos cookies ici..."></textarea></div>
-  <button class="bg" type="submit" style="margin-top:8px">CRÉER</button>
+  <button class="bg" type="submit" style="margin-top:8px">CRÉER LE COMPTE</button>
   </form></div></div></div></body></html>`);
 });
 
 app.post('/admin/new', requireAdmin, (req,res)=>{
-  const { userId, password, yapToken, reportId, pollInterval, autoStart, mgmtCookies } = req.body;
-  if (!userId||!password||!yapToken) return res.redirect('/admin/new?err=1');
+  const { userId, password } = req.body;
+  if (!userId||!password) return res.redirect('/admin/new?err=1');
+  if (getUser(userId)) return res.redirect('/admin/new?err=1');
   const u = {
     userId, botActive:false, isRunning:false, pollTimer:null,
     logs:[], stats:{ confirmed:0, missing:0, rejected:0 },
-    cfg:{ password, yapToken, reportId:reportId||'1', pollInterval:parseInt(pollInterval||60,10), mgmtCookies:mgmtCookies||'', getHeaders:()=>({}) },
+    cfg:{ password, yapToken:'', reportId:REPORT_ID, pollInterval:60, mgmtCookies:'', getHeaders:()=>({}) },
   };
   saveUser(u);
-  if (autoStart==='1') startPolling(u);
   res.redirect('/');
 });
 
@@ -675,15 +674,13 @@ app.get('/admin/user/:id', requireAdmin, (req,res)=>{
   <div class="card"><div class="ch">📋 Logs récents</div><div class="cb">
     <div class="log-box">${logs||'<div class="log-info">Aucun log</div>'}</div>
   </div></div>
-  <div class="card" style="margin-top:12px"><div class="ch">✏️ Modifier config</div><div class="cb">
+  <div class="card" style="margin-top:12px"><div class="ch">✏️ Accès du compte</div><div class="cb">
+  <p style="color:var(--m);font-size:11px;margin-bottom:12px">La configuration technique (token, cookies) est gérée par l'utilisateur depuis son tableau de bord.</p>
   <form method="POST" action="/admin/user/${u.userId}/update">
   <div class="g2">
-    <div class="frow"><label>Token Yapson</label><input name="yapToken" value="${escHtml(u.cfg.yapToken)}"></div>
-    <div class="frow"><label>Report ID</label><input name="reportId" value="${escHtml(u.cfg.reportId)}"></div>
-    <div class="frow"><label>Intervalle (s)</label><input name="pollInterval" type="number" value="${u.cfg.pollInterval}" min="20"></div>
     <div class="frow"><label>Nouveau mot de passe</label><input type="password" name="password" placeholder="Laisser vide = inchangé"></div>
+    <div class="frow"><label>Config renseignée ?</label><div style="padding:8px 0;font-size:12px">${u.cfg.yapToken?'<span style="color:var(--g)">✔ Token OK</span>':'<span style="color:var(--r)">✗ Token manquant</span>'} &nbsp; ${u.cfg.mgmtCookies?'<span style="color:var(--g)">✔ Cookies OK</span>':'<span style="color:var(--r)">✗ Cookies manquants</span>'}</div></div>
   </div>
-  <div class="frow"><label>Cookies my-managment</label><textarea name="mgmtCookies" rows="4">${escHtml(u.cfg.mgmtCookies)}</textarea></div>
   <button class="bb" type="submit" style="margin-top:8px">💾 Enregistrer</button>
   </form></div></div>
   </div></div></div></body></html>`);
@@ -703,12 +700,8 @@ app.post('/admin/user/:id/delete', requireAdmin, (req,res)=>{
 });
 app.post('/admin/user/:id/update', requireAdmin, (req,res)=>{
   const u = getUser(req.params.id); if(!u) return res.redirect('/');
-  const { yapToken, reportId, pollInterval, mgmtCookies, password } = req.body;
-  if (yapToken)    u.cfg.yapToken     = yapToken;
-  if (reportId)    u.cfg.reportId     = reportId;
-  if (pollInterval)u.cfg.pollInterval = parseInt(pollInterval,10);
-  if (mgmtCookies !== undefined) u.cfg.mgmtCookies = mgmtCookies;
-  if (password)    u.cfg.password     = password;
+  const { password } = req.body;
+  if (password && password.trim()) u.cfg.password = password.trim();
   res.redirect(`/admin/user/${u.userId}`);
 });
 
@@ -718,6 +711,8 @@ app.get('/bot', requireLogin, (req,res)=>{
   if (!u) return res.redirect('/login');
   if (req.session.isAdmin) return res.redirect('/');
   const logs = [...u.logs].reverse().slice(0,60).map(l=>`<div class="log-${l.type}">[${l.ts}] ${escHtml(l.message)}</div>`).join('');
+  const cfgOk = u.cfg.yapToken && u.cfg.mgmtCookies;
+  const saved = req.query.saved ? '<div class="alert a-ok">✔ Configuration enregistrée</div>' : '';
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Bot — ${u.userId}</title>
   <meta http-equiv="refresh" content="15"><style>${CSS_COMMON}</style></head>
   <body><div class="wrap">
@@ -725,18 +720,43 @@ app.get('/bot', requireLogin, (req,res)=>{
     <span class="badge ${u.botActive?'b-on':'b-off'}" style="margin-left:8px">${u.botActive?'ACTIF':'ARRÊTÉ'}</span>
     <a href="/logout" style="margin-left:auto;color:var(--m);font-size:10px">Déconnexion</a>
   </div><div class="cb">
+  ${!cfgOk?'<div class="alert a-err">⚠️ Configuration incomplète — renseignez votre Token et vos Cookies ci-dessous avant de démarrer</div>':''}
   <div class="g2" style="margin-bottom:16px">
     <div class="stat"><div class="sv">${u.stats?.confirmed||0}</div><div class="sl">Confirmés</div></div>
     <div class="stat"><div class="sv" style="color:var(--r)">${u.stats?.missing||0}</div><div class="sl">Manqués</div></div>
   </div>
   ${!u.botActive
-    ?`<form method="POST" action="/bot/start"><button class="bg" type="submit">▶ Démarrer le Bot</button></form>`
+    ?`<form method="POST" action="/bot/start"><button class="bg" type="submit" ${!cfgOk?'disabled style="opacity:.4;cursor:not-allowed"':''}>▶ Démarrer le Bot</button></form>`
     :`<form method="POST" action="/bot/stop"><button class="br" type="submit">⏹ Arrêter le Bot</button></form>`}
   </div></div>
+
+  <div class="card"><div class="ch">⚙️ Ma Configuration</div><div class="cb">
+  ${saved}
+  <form method="POST" action="/bot/config">
+  <div class="g2">
+    <div class="frow"><label>Token Yapson</label><input name="yapToken" value="${escHtml(u.cfg.yapToken)}" placeholder="Token API yapson.net" required></div>
+    <div class="frow"><label>Intervalle poll (s)</label><input name="pollInterval" type="number" value="${u.cfg.pollInterval||60}" min="20"></div>
+    <div class="frow"><label>Nouveau mot de passe</label><input type="password" name="password" placeholder="Laisser vide = inchangé"></div>
+  </div>
+  <div class="frow" style="margin-top:8px"><label>Cookies my-managment.com</label><textarea name="mgmtCookies" rows="5" placeholder="Collez vos cookies ici...">${escHtml(u.cfg.mgmtCookies)}</textarea></div>
+  <button class="bb" type="submit" style="margin-top:10px">💾 Enregistrer ma config</button>
+  </form></div></div>
+
   <div class="card"><div class="ch">📋 Activité</div><div class="cb">
     <div class="log-box">${logs||'<div class="log-info">En attente de démarrage...</div>'}</div>
   </div></div>
   </div></body></html>`);
+});
+
+app.post('/bot/config', requireLogin, (req,res)=>{
+  const u = getUser(req.session.userId); if(!u) return res.redirect('/login');
+  const { yapToken, reportId, pollInterval, mgmtCookies, password } = req.body;
+  if (yapToken    !== undefined) u.cfg.yapToken     = yapToken.trim();
+  // reportId géré par variable d'environnement, pas modifiable par l'utilisateur
+  if (pollInterval)              u.cfg.pollInterval = Math.max(20, parseInt(pollInterval,10)||60);
+  if (mgmtCookies !== undefined) u.cfg.mgmtCookies  = mgmtCookies.trim();
+  if (password && password.trim()) u.cfg.password   = password.trim();
+  res.redirect('/bot?saved=1');
 });
 
 app.post('/bot/start', requireLogin, (req,res)=>{

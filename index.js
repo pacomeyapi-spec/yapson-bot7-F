@@ -1,17 +1,17 @@
 'use strict';
-// ============================================================
+// ========================================================
 // yapson-bot7-f — Multi-utilisateurs
 // Logique: fournisseur par fournisseur, réseau auto-détecté
 // Confirmation avec fichier image obligatoire
 // Timeout payout: 2 minutes max, passe au suivant si échec
-// ============================================================
+// ========================================================
 
 const express  = require('express');
 const fetch    = require('node-fetch');
 const FormData = require('form-data');
 const crypto   = require('crypto');
 
-const app  = express();
+const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -19,7 +19,7 @@ const PORT       = parseInt(process.env.PORT || '8080', 10);
 let   ADMIN_USER = process.env.ADMIN_USER || 'admin';
 let   ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
 
-// ── Sessions ──────────────────────────────────────────────────
+// — Sessions ——————————————————————————————————
 const sessions = {};
 function createSession(userId, isAdmin) {
   const token = crypto.randomBytes(32).toString('hex');
@@ -36,37 +36,23 @@ function getSession(req) {
 function requireLogin(req, res, next) { const s=getSession(req); if(!s) return res.redirect('/login'); req.session=s; next(); }
 function requireAdmin(req, res, next) { const s=getSession(req); if(!s||!s.isAdmin) return res.redirect('/login'); req.session=s; next(); }
 
-// ── Stockage utilisateurs ─────────────────────────────────────
+// — Stockage utilisateurs ————————————————————
 const users = {};
-function hashPass(p) { return crypto.createHash('sha256').update(p).digest('hex'); }
+function saveUser(u) { users[u.userId] = u; }
+function getUser(userId) { return users[userId] || null; }
+function getAllUsers() { return Object.values(users); }
 
-function createUser(username, password) {
-  const id = crypto.randomBytes(8).toString('hex');
-  users[id] = {
-    id, username,
-    passwordHash: hashPass(password),
-    cfg: {
-      mgmtCookies : '',
-      yapsonToken : '',
-      reportId    : process.env.REPORT_ID || '8231c3be3216307da83c067d263c09ec',
-      pollInterval: parseInt(process.env.POLL_INTERVAL || '900'),
-      maxSolde    : parseInt(process.env.MAX_SOLDE || '0'),
-    },
-    stats: { confirmed:0, missing:0, fixed:0, polls:0, rejected:0 },
-    logs: [],
-    pollTimer: null, isRunning: false, botActive: false,
-  };
-  return users[id];
-}
+// — Utilitaires ——————————————————————————————
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function ulog(u, type, msg) {
+function ulog(u, type, message) {
   const ts = new Date().toISOString().replace('T',' ').substring(0,19);
-  u.logs.unshift({ ts, type, msg });
-  if (u.logs.length > 500) u.logs.pop();
-  console.log(`[${u.username}][${type.toUpperCase()}] ${ts} — ${msg}`);
+  u.logs.push({ts,type,message});
+  if (u.logs.length > 500) u.logs.shift();
+  console.log(`[${u.userId}][${type.toUpperCase()}]${ts}—${message}`);
 }
 
-// ── Mapping réseau ────────────────────────────────────────────
+// — Cartographie réseau ——————————————————————
 const NET_UUIDS = {
   'MOOV CI'  : '24462fd9-c8e2-42f2-a95f-119844bc2ada',
   'MTN CI'   : '77e8e729-a0f1-4e1b-8614-168c77f4b101',
@@ -83,10 +69,10 @@ function detectNetwork(title) {
   return 'Orangeint';
 }
 
-// ── Utilitaires cookies ───────────────────────────────────────
+// — Utilitaires cookies ——————————————————————
 function parseCookies(raw) {
   if (!raw) return '';
-  let s = raw.trim().replace(/^\([^)]*\)\s*/,'').replace(/^[^[a-zA-Z]+/,'').trim();
+  let s = raw.trim().replace(/^\(([^)]*)\)\s*/, '').replace(/^[^[a-zA-Z]+/, '').trim();
   if (!s) return '';
   if (s.startsWith('[')) {
     try {
@@ -107,48 +93,62 @@ function mgmtH(u) {
     'Cookie'           : parseCookies(u.cfg.mgmtCookies),
     'User-Agent'       : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     'Referer'          : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
+    'Origin'           : 'https://my-managment.com',
+    ...u.cfg.getHeaders(),
   };
 }
-function yapH(u) {
-  return { 'Content-Type':'application/json', 'Authorization': `Bearer ${u.cfg.yapsonToken}` };
-}
-function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
 
-// ── Lire tous les retraits ────────────────────────────────────
-async function getAllWithdrawals(u) {
-  const res = await fetch('https://my-managment.com/admin/report/pendingrequestwithdrawal', {
-    method:'POST', headers:mgmtH(u), body:JSON.stringify({page:1,limit:500}),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} — cookies expirés ?`);
-  const data = await res.json();
-  if (data.is_guest) throw new Error('Session expirée — injecter nouveaux cookies');
-  const rows = data.data || [];
+function yapH(u) {
+  return {
+    'Accept'       : 'application/json, text/plain, */*',
+    'Content-Type' : 'application/json',
+    'Authorization': `Token ${u.cfg.yapToken}`,
+  };
+}
+
+// — Fetch retraits depuis my-managment ————————
+async function fetchWithdrawals(u) {
+  const res = await fetch('https://my-managment.com/admin/banktransfer/getallbanksbysubagentid', {
+    method : 'POST',
+    headers: mgmtH(u),
+    body   : JSON.stringify({ id: null, ref_id: 1 }),
+  }).catch(()=>({status:0}));
+  if (!res || res.status === 0) return [];
+  const text = await res.text().catch(()=>'');
+  try {
+    const j = JSON.parse(text);
+    if (!Array.isArray(j)) return [];
+    return j.filter(r => r.status === 'pending' || r.status === 'PENDING');
+  } catch(e) { return []; }
+}
+
+// — Groupement par fournisseur ————————————————
+function groupBySubagent(rows, cd_map) {
   const groups = {};
   for (const row of rows) {
-    const montant = row.summa_sort || parseInt((row.summa||'').replace(/[^0-9]/g,''))||0;
-    const phone   = row.dopparam?.[0]?.description || '';
-    const netTitle= row.dopparam?.[0]?.title || '';
-    const pm      = String(phone).match(/0[0-9]{9}/);
-    const cd      = row.confirm?.[0]?.data || null;
-    const sid     = cd?.subagent_id;
+    const pm = row.phone_number ? [row.phone_number] : [];
+    const cd = cd_map ? cd_map[row.id] : null;
+    const sid = row.subagent_id;
+    if (!sid) continue;
+    const netTitle = row.network_name || row.network || '';
     const filesRequired = cd?.files_required || 0;
-    const subagentName  = row.subagent || `Fournisseur_${sid}`;
-    if (!pm || montant <= 0 || !cd || !sid) continue;
+    const subagentName = row.subagent || `Fournisseur_${sid}`;
+    if (!pm || pm.length <= 0 || !cd || !sid) continue;
     if (!groups[sid]) groups[sid] = { subagent_id:sid, subagentName, netTitle, network:detectNetwork(netTitle), filesRequired, items:[] };
-    groups[sid].items.push({ phone:pm[0], montant, confirmData:cd, netTitle });
+    groups[sid].items.push({ phone:pm[0], montant:row.montant||row.amount, confirmData:cd, netTitle });
   }
   return groups;
 }
 
-// ── Décaissement yapson ───────────────────────────────────────
+// — Décaissement yapson ———————————————————————
 async function payout(u, item, network) {
   const uuid = NET_UUIDS[network] || NET_UUIDS['Orangeint'];
   const res  = await fetch('https://connect.yapson.net/api/aggregator/payout/', {
-    method:'POST', headers:yapH(u),
-    body:JSON.stringify({ amount:item.montant, recipient_phone:item.phone, network:uuid }),
+    method : 'POST', headers: yapH(u),
+    body   : JSON.stringify({ amount:item.montant, recipient_phone:item.phone, network:uuid }),
   });
   const body = await res.json().catch(()=>({}));
-  ulog(u, 'info', `  🔍 Payout réponse [${res.status}]: ${JSON.stringify(body).substring(0,120)}`);
+  ulog(u, 'info', `  🔎 Payout réponse [${res.status}]: ${JSON.stringify(body).substring(0,120)}`);
   if (res.status===200||res.status===201) {
     const uid = body.uid || body.id || body.reference || null;
     return { ok:true, uid, phone:item.phone, montant:item.montant };
@@ -156,7 +156,7 @@ async function payout(u, item, network) {
   return { ok:false, err:JSON.stringify(body).substring(0,100) };
 }
 
-// ── Attendre SUCCESS — timeout 2 minutes, passe au suivant si échec ──
+// — Attendre SUCCESS — timeout 2 minutes, passe au suivant si échec —
 async function waitForSuccess(u, uid, phone, maxWait=120000) {
   const start = Date.now();
   function normalizePhone(p) {
@@ -168,170 +168,222 @@ async function waitForSuccess(u, uid, phone, maxWait=120000) {
   const phoneNorm = normalizePhone(phone);
   while (Date.now() - start < maxWait) {
     await sleep(5000);
-    // Vérifier si timeout atteint AVANT la requête
     if (Date.now() - start >= maxWait) break;
     try {
-      let tx = null;
+      const res = await fetch('https://connect.yapson.net/api/aggregator/transactions/?limit=20', {
+        headers: yapH(u),
+      });
+      const body = await res.json().catch(()=>({}));
+      const txs = body.results || body.data || (Array.isArray(body) ? body : []);
       if (uid) {
-        const res = await fetch(`https://connect.yapson.net/api/aggregator/transactions/${uid}/`, { headers: yapH(u) });
-        tx = await res.json();
+        const tx = txs.find(t => t.uid===uid || t.id===uid || t.reference===uid);
+        if (tx) {
+          if (tx.status==='SUCCESS'||tx.status==='COMPLETED'||tx.status==='success') return { ok:true, tx };
+          if (tx.status==='FAILED'||tx.status==='REJECTED'||tx.status==='failed')    return { ok:false, skip:true, err:`Statut: ${tx.status}` };
+        }
       } else {
-        const res = await fetch('https://connect.yapson.net/api/aggregator/transactions/?limit=50', { headers: yapH(u) });
-        const data = await res.json();
-        const results = data.results || data.data || [];
-        tx = results.find(t => normalizePhone(t.recipient_phone)===phoneNorm && (t.status==='pending'||t.status==='success'));
+        const tx = txs.find(t => {
+          const tp = normalizePhone(t.recipient_phone||t.phone||'');
+          return tp === phoneNorm && (t.status==='SUCCESS'||t.status==='COMPLETED'||t.status==='success');
+        });
+        if (tx) return { ok:true, tx };
       }
-      if (!tx) { ulog(u, 'info', `⏳ Transaction introuvable pour ${phone}...`); continue; }
-      if (tx.status==='success') return { ok:true, tx };
-      if (tx.status==='failed')  return { ok:false, err:`Transaction échouée: ${tx.error_message||''}`, skip:true };
-      ulog(u, 'info', `⏳ ${(tx.uid||phone).substring(0,8)} status=${tx.status}... (${Math.round((Date.now()-start)/1000)}s)`);
-    } catch(e) { ulog(u, 'info', `⏳ attente... (${Math.round((Date.now()-start)/1000)}s)`); }
+    } catch(e) { ulog(u, 'warn', `waitForSuccess erreur: ${e.message}`); }
   }
-  // Timeout 2 minutes atteint → ignorer ce numéro, passer au suivant
-  return { ok:false, err:`Timeout 2min — ${phone} ignoré, passage au suivant`, skip:true };
+  return { ok:false, skip:true, err:'Timeout 2min' };
 }
 
-// ── Générer capture SMS — PNG pur JS (pngjs, pas de binaires natifs) ──
-async function generateTxScreenshot(tx) {
-  const dt      = (tx.completed_at||tx.created_at||new Date().toISOString()).replace('T',' ').substring(0,19);
-  const ref     = tx.reference||tx.uid||'N/A';
-  const phone   = tx.recipient_phone||'';
-  const amount  = parseInt(tx.amount||0).toLocaleString('fr-FR');
-  const network = (tx.network_name||tx.network||'').toUpperCase();
+// — Génération capture nette avec node-canvas ————————————————
+function generateTxScreenshot(tx) {
+  const phone   = String(tx?.recipient_phone || tx?.phone || '');
+  const amount  = String(tx?.amount || tx?.montant || '');
+  const ref     = String(tx?.uid || tx?.id || tx?.reference || '');
+  const network = String(tx?.network_name || tx?.network || 'Mobile Money');
+  const dt      = tx?.created_at || tx?.date || new Date().toISOString();
   const dateMatch = dt.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}:\d{2}:\d{2})/);
-  const dateFmt = dateMatch?`le ${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]} ${dateMatch[4]}`:dt;
-  const idTx    = String(ref).replace(/[^0-9A-Z]/gi,'').slice(-10).toUpperCase();
-  const dispDate= dateMatch?`${dateMatch[3]}/${dateMatch[2]}/${dateMatch[1]} ${dateMatch[4].substring(0,5)}`:dt;
-
-  // Couleur de la bande latérale selon le réseau
-  const netBg = network.includes('WAVE')?[30,136,255]:network.includes('MTN')?[255,215,0]:network.includes('MOOV')?[0,136,204]:[255,107,0];
+  const dateFmt   = dateMatch
+    ? `le ${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]} ${dateMatch[4]}`
+    : dt;
+  const idTx = String(ref).replace(/[^0-9A-Za-z]/gi,'').slice(-10).toUpperCase();
 
   try {
-    const { PNG } = require('pngjs');
-    const W = 600, H = 380;
-    const png = new PNG({ width:W, height:H, filterType:-1 });
+    const { createCanvas } = require('canvas');
+    const W = 640, H = 400;
+    const canvas = createCanvas(W, H);
+    const ctx    = canvas.getContext('2d');
 
-    // Remplir fond blanc
-    for (let y=0;y<H;y++) for (let x=0;x<W;x++) {
-      const i=(y*W+x)*4;
-      png.data[i]=245; png.data[i+1]=245; png.data[i+2]=247; png.data[i+3]=255;
+    // Helper arrondi
+    function roundRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x+r, y);
+      ctx.lineTo(x+w-r, y);
+      ctx.quadraticCurveTo(x+w, y, x+w, y+r);
+      ctx.lineTo(x+w, y+h-r);
+      ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+      ctx.lineTo(x+r, y+h);
+      ctx.quadraticCurveTo(x, y+h, x, y+h-r);
+      ctx.lineTo(x, y+r);
+      ctx.quadraticCurveTo(x, y, x+r, y);
+      ctx.closePath();
     }
 
-    function setPixel(x,y,r,g,b,a=255) {
-      if(x<0||y<0||x>=W||y>=H) return;
-      const i=(y*W+x)*4; png.data[i]=r;png.data[i+1]=g;png.data[i+2]=b;png.data[i+3]=a;
-    }
-    function fillRect(x,y,w,h,r,g,b,a=255) {
-      for(let dy=0;dy<h;dy++) for(let dx=0;dx<w;dx++) setPixel(x+dx,y+dy,r,g,b,a);
-    }
-    function drawText(text, px, py, r=34, g=34, b=34) {
-      // Police bitmap 6x8 simplifiée — chaque char = bloc de pixels
-      const charW=7, charH=12;
-      for(let ci=0;ci<text.length;ci++) {
-        const cx=px+ci*charW;
-        // Dessiner un bloc coloré pour chaque caractère (rendu symbolique lisible)
-        const c=text.charCodeAt(ci);
-        if(c>32) { // espace = vide
-          for(let dy=1;dy<charH-1;dy++) for(let dx=1;dx<charW-1;dx++) setPixel(cx+dx,py+dy,r,g,b);
-        }
-      }
-    }
+    // Couleurs réseau
+    const netBg = network.toLowerCase().includes('wave')   ? '#1e88ff'
+                : network.toLowerCase().includes('mtn')    ? '#ffd700'
+                : network.toLowerCase().includes('moov')   ? '#0088cc'
+                : '#ff6b00';
+    const netFg = network.toLowerCase().includes('mtn')    ? '#333' : '#fff';
 
-    // Fond blanc de la carte
-    fillRect(20,20,W-40,H-40,255,255,255);
+    // Fond général
+    ctx.fillStyle = '#f0f2f5';
+    ctx.fillRect(0, 0, W, H);
 
-    // Bande latérale colorée selon réseau
-    fillRect(20,20,6,H-40,...netBg);
+    // Carte principale blanche
+    ctx.fillStyle = '#ffffff';
+    roundRect(18, 18, W-36, H-36, 12);
+    ctx.fill();
+    ctx.strokeStyle = '#d8dde6';
+    ctx.lineWidth = 1;
+    ctx.stroke();
 
-    // Ligne séparatrice haut
-    fillRect(26,20,W-46,2,224,224,224);
-    // Ligne séparatrice bas
-    fillRect(26,H-22,W-46,2,224,224,224);
+    // Bande colorée gauche (réseau)
+    ctx.fillStyle = netBg;
+    roundRect(18, 18, 7, H-36, 6);
+    ctx.fill();
 
-    // Badge SMS (bleu clair)
-    fillRect(40,36,60,24,227,242,253);
-    drawText('SMS',46,42,25,118,210);
+    // — Ligne 1 : Badge SMS + Date —
+    // Badge SMS
+    ctx.fillStyle = '#e3f2fd';
+    roundRect(38, 34, 66, 26, 5);
+    ctx.fill();
+    ctx.fillStyle = '#1565c0';
+    ctx.font = 'bold 13px Arial, sans-serif';
+    ctx.fillText('📱 SMS', 44, 51);
 
-    // Date (droite)
-    drawText(dispDate,W-140,42,153,153,153);
+    // Date droite
+    ctx.fillStyle = '#9e9e9e';
+    ctx.font = '12px Arial, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(dateFmt, W-30, 51);
+    ctx.textAlign = 'left';
 
-    // Badge numéro de téléphone (fond orange clair)
-    fillRect(40,80,250,34,255,243,224);
-    drawText('TEL: '+phone,48,88,255,107,0);
+    // Séparateur
+    ctx.fillStyle = '#eeeeee';
+    ctx.fillRect(38, 68, W-56, 1);
 
-    // Réseau badge
-    fillRect(310,80,120,34,...netBg);
-    drawText(network.substring(0,10),316,88,255,255,255);
+    // — Ligne 2 : Téléphone + Réseau —
+    // Badge téléphone fond orange pâle
+    ctx.fillStyle = '#fff3e0';
+    roundRect(38, 78, 260, 36, 6);
+    ctx.fill();
+    ctx.fillStyle = '#e65100';
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.fillText(`📞 +225 ${phone}`, 48, 101);
 
-    // Texte principal
-    drawText('Vous avez envoye '+amount+' FCFA au',40,140);
-    drawText('+225 '+phone,40,160,25,118,210);
-    drawText(dateFmt,40,180);
-    drawText('Montant: '+amount+' FCFA',40,210,46,125,50);
-    drawText('ID Transaction: '+idTx,40,235);
-    drawText('Ref: '+ref.substring(0,30),40,255,136,136,136);
+    // Badge réseau
+    ctx.fillStyle = netBg;
+    roundRect(W-148, 78, 118, 36, 6);
+    ctx.fill();
+    ctx.fillStyle = netFg;
+    ctx.font = 'bold 13px Arial, sans-serif';
+    ctx.fillText(network.substring(0,12), W-138, 101);
 
-    // Badge SUCCESS (vert clair)
-    fillRect(W-170,H-62,140,28,232,245,233);
-    fillRect(W-170,H-62,4,28,46,125,50); // barre verte
-    drawText('OK  SUCCESS',W-160,H-53,46,125,50);
+    // — Corps principal —
+    // Texte envoi
+    ctx.fillStyle = '#212121';
+    ctx.font = '15px Arial, sans-serif';
+    ctx.fillText(`Vous avez envoyé ${amount} FCFA au`, 38, 138);
+    ctx.fillStyle = '#1565c0';
+    ctx.font = 'bold 16px Arial, sans-serif';
+    ctx.fillText(`+225 ${phone}`, 38, 160);
 
-    const buffer = PNG.sync.write(png);
-    return { buffer, mimeType:'image/png', filename:'image.png' };
+    // Date/heure
+    ctx.fillStyle = '#757575';
+    ctx.font = '13px Arial, sans-serif';
+    ctx.fillText(dateFmt, 38, 182);
+
+    // Séparateur fin
+    ctx.fillStyle = '#f5f5f5';
+    ctx.fillRect(38, 196, W-76, 1);
+
+    // Détails transaction
+    ctx.fillStyle = '#2e7d32';
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.fillText(`Montant : ${amount} FCFA`, 38, 218);
+
+    ctx.fillStyle = '#424242';
+    ctx.font = '14px Arial, sans-serif';
+    ctx.fillText(`ID Transaction : ${idTx}`, 38, 242);
+
+    ctx.fillStyle = '#9e9e9e';
+    ctx.font = '12px Arial, sans-serif';
+    ctx.fillText(`Réf : ${ref.substring(0,34)}`, 38, 264);
+
+    // — Badge SUCCESS —
+    ctx.fillStyle = '#e8f5e9';
+    roundRect(W-178, H-58, 148, 32, 8);
+    ctx.fill();
+    ctx.fillStyle = '#2e7d32';
+    ctx.fillRect(W-178, H-58, 5, 32);
+    ctx.fillStyle = '#1b5e20';
+    ctx.font = 'bold 14px Arial, sans-serif';
+    ctx.fillText('✅  OK  SUCCESS', W-168, H-36);
+
+    return { buffer: canvas.toBuffer('image/png'), mimeType:'image/png', filename:'image.png' };
+
   } catch(e) {
-    // Fallback SVG → converti en réponse HTML si PNG indispo
+    // Fallback SVG si canvas indispo
     return generateSvgFallback(phone, amount, idTx, dateFmt, network, ref);
   }
 }
 
 function generateSvgFallback(phone, amount, idTx, dateFmt, network, ref) {
-  // Génère un SVG lisible encodé comme PNG via Buffer
-  const netColor = network.includes('WAVE')?'#1e88ff':network.includes('MTN')?'#ffd700':network.includes('MOOV')?'#0088cc':'#ff6b00';
-  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='600' height='380'>
-<rect width='600' height='380' fill='#f5f5f7'/>
-<rect x='20' y='20' width='560' height='340' rx='10' fill='white' stroke='#e0e0e0'/>
-<rect x='20' y='20' width='6' height='340' fill='${netColor}'/>
-<rect x='40' y='36' width='60' height='24' rx='4' fill='#e3f2fd'/>
-<text x='55' y='53' font-family='Arial' font-size='13' font-weight='bold' fill='#1976d2'>SMS</text>
-<rect x='40' y='80' width='260' height='32' rx='6' fill='#fff3e0'/>
-<text x='50' y='101' font-family='Arial' font-size='14' font-weight='bold' fill='#ff6b00'>TEL: ${phone}</text>
-<text x='40' y='145' font-family='Arial' font-size='14' fill='#222'>Vous avez envoye ${amount} FCFA au</text>
-<text x='40' y='168' font-family='Arial' font-size='14' fill='#1976d2'>+225 ${phone}</text>
-<text x='40' y='190' font-family='Arial' font-size='13' fill='#222'>${dateFmt}</text>
-<text x='40' y='215' font-family='Arial' font-size='14' font-weight='bold' fill='#2e7d32'>Montant: ${amount} FCFA</text>
-<text x='40' y='238' font-family='Arial' font-size='13' fill='#222'>ID Transaction: ${idTx}</text>
-<text x='40' y='260' font-family='Arial' font-size='11' fill='#888'>Ref: ${ref.substring(0,40)}</text>
-<rect x='430' y='318' width='140' height='28' rx='5' fill='#e8f5e9'/>
-<text x='445' y='337' font-family='Arial' font-size='12' font-weight='bold' fill='#2e7d32'>OK  SUCCESS</text>
+  const netColor = network.includes('Wave') ?'#1e88ff': network.includes('MTN') ?'#ffd700': network.includes('MOOV') ?'#0088cc':'#ff6b00';
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='640' height='400'>
+<rect width='640' height='400' fill='#f0f2f5'/>
+<rect x='18' y='18' width='604' height='364' rx='10' fill='white' stroke='#d8dde6'/>
+<rect x='18' y='18' width='7' height='364' fill='${netColor}'/>
+<rect x='38' y='34' width='66' height='26' rx='5' fill='#e3f2fd'/>
+<text x='46' y='51' font-family='Arial' font-size='13' font-weight='bold' fill='#1565c0'>SMS</text>
+<text x='610' y='51' font-family='Arial' font-size='12' fill='#9e9e9e' text-anchor='end'>${dateFmt}</text>
+<rect x='38' y='68' width='564' height='1' fill='#eee'/>
+<rect x='38' y='78' width='260' height='36' rx='6' fill='#fff3e0'/>
+<text x='48' y='101' font-family='Arial' font-size='15' font-weight='bold' fill='#e65100'>+225 ${phone}</text>
+<rect x='492' y='78' width='130' height='36' rx='6' fill='${netColor}'/>
+<text x='502' y='101' font-family='Arial' font-size='13' font-weight='bold' fill='white'>${network.substring(0,12)}</text>
+<text x='38' y='138' font-family='Arial' font-size='15' fill='#212121'>Vous avez envoye ${amount} FCFA au</text>
+<text x='38' y='160' font-family='Arial' font-size='16' font-weight='bold' fill='#1565c0'>+225 ${phone}</text>
+<text x='38' y='182' font-family='Arial' font-size='13' fill='#757575'>${dateFmt}</text>
+<rect x='38' y='196' width='564' height='1' fill='#f5f5f5'/>
+<text x='38' y='218' font-family='Arial' font-size='15' font-weight='bold' fill='#2e7d32'>Montant : ${amount} FCFA</text>
+<text x='38' y='242' font-family='Arial' font-size='14' fill='#424242'>ID Transaction : ${idTx}</text>
+<text x='38' y='264' font-family='Arial' font-size='12' fill='#9e9e9e'>Ref : ${ref.substring(0,34)}</text>
+<rect x='462' y='342' width='148' height='32' rx='8' fill='#e8f5e9'/>
+<rect x='462' y='342' width='5' height='32' fill='#2e7d32'/>
+<text x='474' y='363' font-family='Arial' font-size='14' font-weight='bold' fill='#1b5e20'>OK  SUCCESS</text>
 </svg>`;
-  // Encoder le SVG en buffer — certains serveurs acceptent SVG comme image
   return { buffer: Buffer.from(svg, 'utf8'), mimeType:'image/svg+xml', filename:'image.svg' };
 }
 
-// ── Confirmation avec fichier ─────────────────────────────────
+// — Confirmation avec fichier ————————————————
 async function confirmWithFile(u, item, fileBuffer, mimeType, filename) {
   const cd = item.confirmData;
   const fs = require('fs'), os = require('os'), path = require('path');
   await fetch('https://my-managment.com/admin/banktransfer/getallbanksbysubagentid', {
-    method:'POST', headers:mgmtH(u), body:JSON.stringify({id:cd.subagent_id,ref_id:cd.ref_id||1}),
+    method :'POST', headers:mgmtH(u), body:JSON.stringify({id:cd.subagent_id,ref_id:cd.ref_id||1}),
   }).catch(()=>{});
   await sleep(400);
   const uniqueName = `confirm_${Date.now()}_${Math.random().toString(36).substring(2,8)}.png`;
-  const tmpFile = path.join(os.tmpdir(), uniqueName);
-  const fd_write = fs.openSync(tmpFile,'w');
-  fs.writeSync(fd_write,fileBuffer,0,fileBuffer.length,0); fs.fsyncSync(fd_write); fs.closeSync(fd_write);
-  const stat = fs.statSync(tmpFile);
-  if (stat.size===0) return { ok:false, err:'Fichier temporaire vide' };
-  let result;
+  const tmpFile    = path.join(os.tmpdir(), uniqueName);
+  fs.writeFileSync(tmpFile, fileBuffer);
+  const fd = new FormData();
+  fd.append('code','epay'); fd.append('id',String(cd.id)); fd.append('comment',''); fd.append('commentId','null'); fd.append('otherComment',''); fd.append('is_out','true');
+  fd.append('subagent_id',String(cd.subagent_id)); fd.append('ref_id',String(cd.ref_id||1)); fd.append('bank_id',cd.bank_id?String(cd.bank_id):'null');
+  fd.append('report_id',u.cfg.reportId); fd.append('user_id',String(cd.user_id||''));
+  fd.append('approve_doc', fs.createReadStream(tmpFile),{filename:'image.png',contentType:mimeType||'image/png'});
+  const h = {'Accept':'application/json, text/plain, */*','X-Requested-With':'XMLHttpRequest','X-Time-Zone':'GMT+00','Cookie':parseCookies(u.cfg.mgmtCookies),'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36','Referer':'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal','Origin':'https://my-managment.com',...fd.getHeaders()};
+  const result = {};
   try {
-    const fd = new FormData();
-    fd.append('code',cd.code||'epay'); fd.append('id',String(cd.id));
-    fd.append('comment',''); fd.append('commentId','null'); fd.append('otherComment','');
-    fd.append('is_out','true'); fd.append('subagent_id',String(cd.subagent_id));
-    fd.append('ref_id',String(cd.ref_id||1)); fd.append('bank_id',cd.bank_id?String(cd.bank_id):'null');
-    fd.append('report_id',u.cfg.reportId); fd.append('user_id',String(cd.user_id||''));
-    fd.append('approve_doc',fs.createReadStream(tmpFile),{filename:'image.png',contentType:mimeType||'image/png'});
-    const h = {'Accept':'application/json, text/plain, */*','X-Requested-With':'XMLHttpRequest','X-Time-Zone':'GMT+00','Cookie':parseCookies(u.cfg.mgmtCookies),'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36','Referer':'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal','Origin':'https://my-managment.com',...fd.getHeaders()};
     const res = await fetch('https://my-managment.com/admin/banktransfer/approvemoney',{method:'POST',headers:h,body:fd});
     if (res.status===200||res.status===302) {
       const text = await res.text();
@@ -342,15 +394,17 @@ async function confirmWithFile(u, item, fileBuffer, mimeType, filename) {
   return result;
 }
 
-// ── Confirmation sans fichier ─────────────────────────────────
+// — Confirmation sans fichier ————————————————
 async function confirmWithoutFile(u, item) {
   const cd = item.confirmData;
   await fetch('https://my-managment.com/admin/banktransfer/getallbanksbysubagentid', {
-    method:'POST', headers:mgmtH(u), body:JSON.stringify({id:cd.subagent_id,ref_id:cd.ref_id||1}),
+    method :'POST', headers:mgmtH(u), body:JSON.stringify({id:cd.subagent_id,ref_id:cd.ref_id||1}),
   }).catch(()=>{});
   await sleep(400);
   const fd = new FormData();
-  fd.append('code',cd.code||'epay'); fd.append('id',String(cd.id)); fd.append('comment',''); fd.append('commentId','null'); fd.append('otherComment',''); fd.append('is_out','true'); fd.append('subagent_id',String(cd.subagent_id)); fd.append('ref_id',String(cd.ref_id||1)); fd.append('bank_id',cd.bank_id?String(cd.bank_id):'null'); fd.append('report_id',u.cfg.reportId); fd.append('user_id',String(cd.user_id||''));
+  fd.append('code','epay'); fd.append('id',String(cd.id)); fd.append('comment',''); fd.append('commentId','null'); fd.append('otherComment',''); fd.append('is_out','true');
+  fd.append('subagent_id',String(cd.subagent_id)); fd.append('ref_id',String(cd.ref_id||1)); fd.append('bank_id',cd.bank_id?String(cd.bank_id):'null');
+  fd.append('report_id',u.cfg.reportId); fd.append('user_id',String(cd.user_id||''));
   const h = {'Accept':'application/json, text/plain, */*','X-Requested-With':'XMLHttpRequest','X-Time-Zone':'GMT+00','Cookie':parseCookies(u.cfg.mgmtCookies),'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36','Referer':'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',...fd.getHeaders()};
   const res = await fetch('https://my-managment.com/admin/banktransfer/approvemoney',{method:'POST',headers:h,body:fd});
   if (res.status===200||res.status===302) {
@@ -362,33 +416,41 @@ async function confirmWithoutFile(u, item) {
   return {ok:false,err:`HTTP ${res.status} — ${et.substring(0,80)}`};
 }
 
-// ── Cycle principal par utilisateur ──────────────────────────
+// — Cycle principal par utilisateur ——————————
 async function runCycle(u) {
   if (u.isRunning) return;
-  u.isRunning = true; u.stats.polls++;
-  ulog(u,'info',`━━ Poll #${u.stats.polls} ━━`);
+  u.isRunning = true;
+  u.stats = u.stats || { confirmed:0, missing:0, rejected:0 };
   try {
-    if (!parseCookies(u.cfg.mgmtCookies)) throw new Error('Cookies manquants');
-    if (!u.cfg.yapsonToken) throw new Error('Token YapsonPress manquant');
+    const rows = await fetchWithdrawals(u);
+    if (!rows.length) { ulog(u,'info','Aucun retrait en attente'); u.isRunning=false; return; }
+    ulog(u,'info',`${rows.length} retrait(s) trouvé(s)`);
 
-    const groups = await getAllWithdrawals(u);
-    const groupList = Object.values(groups);
-    if (!groupList.length) { ulog(u,'info','Poll: 0 retrait en attente'); u.isRunning=false; return; }
+    // Construire map confirmData
+    const cd_map = {};
+    for (const row of rows) {
+      cd_map[row.id] = {
+        id          : row.id,
+        subagent_id : row.subagent_id,
+        ref_id      : row.ref_id || 1,
+        bank_id     : row.bank_id || null,
+        user_id     : row.user_id || '',
+        files_required: row.files_required || 0,
+      };
+    }
 
-    ulog(u,'info',`${groupList.length} fournisseur(s) — ${groupList.map(g=>`${g.subagentName.substring(0,20)}(${g.items.length})`).join(', ')}`);
-
-    for (const group of groupList) {
+    const groups = groupBySubagent(rows, cd_map);
+    for (const sid of Object.keys(groups)) {
+      const group = groups[sid];
       const { subagentName, network, filesRequired, items } = group;
-      ulog(u,'info',`▶ ${subagentName} | ${network} | ${items.length} retrait(s) | Fichier: ${filesRequired?'OUI':'NON'}`);
+      ulog(u,'info',`▶ Fournisseur: ${subagentName.substring(0,20)} (${items.length} items, réseau: ${network})`);
 
       for (const item of items) {
-        ulog(u,'info',`  → ${item.phone} — ${item.montant.toLocaleString()} FCFA [${network}]`);
-
         // 1. Décaisser
         const payResult = await payout(u, item, network);
         if (!payResult.ok) {
           u.stats.missing++;
-          ulog(u,'err',`  ✘ Décaissement échoué: ${item.phone} — ${payResult.err}`);
+          ulog(u,'err',`  ✗ Décaissement échoué: ${item.phone} — ${payResult.err}`);
           await sleep(800);
           continue;
         }
@@ -402,20 +464,19 @@ async function runCycle(u) {
           if (!waitResult.ok) {
             u.stats.missing++;
             if (waitResult.skip) {
-              // Timeout ou échec → ignorer ce numéro et passer au suivant
-              ulog(u,'warn',`  ⚠ ${waitResult.err} — numéro ignoré`);
+              ulog(u,'warn',`  △ ${waitResult.err} — numéro ignoré`);
             } else {
-              ulog(u,'warn',`  ⚠ ${item.phone} — ${waitResult.err}`);
+              ulog(u,'warn',`  △ ${item.phone} — ${waitResult.err}`);
             }
             await sleep(800);
-            continue; // ← passe au numéro suivant
+            continue;
           }
 
           ulog(u,'ok',`  ✔ Transaction SUCCESS: ${waitResult.tx?.uid?.substring(0,8)||'?'}`);
-          const screenshot = await generateTxScreenshot(waitResult.tx);
+          const screenshot    = await generateTxScreenshot(waitResult.tx);
           const confirmResult = await confirmWithFile(u, item, screenshot.buffer, screenshot.mimeType, screenshot.filename);
           if (confirmResult.ok) { u.stats.confirmed++; ulog(u,'ok',`  ✔ Confirmé avec fichier: ${item.phone}`); }
-          else { u.stats.missing++; ulog(u,'warn',`  ⚠ Confirmation échouée: ${item.phone} — ${confirmResult.err}`); }
+          else { u.stats.missing++; ulog(u,'warn',`  △ Confirmation échouée: ${item.phone} — ${confirmResult.err}`); }
 
         } else {
           // Pas de fichier requis — mais on vérifie quand même la transaction (timeout 2min)
@@ -424,15 +485,18 @@ async function runCycle(u) {
 
           if (!waitResult.ok) {
             u.stats.missing++;
-            ulog(u,'warn',`  ⚠ ${waitResult.err} — numéro ignoré`);
-            await sleep(800);
-            continue; // ← passe au numéro suivant
+            if (waitResult.skip) {
+              ulog(u,'warn',`  △ ${waitResult.err} — ${item.phone} ignoré`);
+            } else {
+              ulog(u,'warn',`  △ ${item.phone} — ${waitResult.err}`);
+            }
+            await sleep(700);
+            continue;
           }
 
-          await sleep(1000);
           const confirmResult = await confirmWithoutFile(u, item);
           if (confirmResult.ok) { u.stats.confirmed++; ulog(u,'ok',`  ✔ Confirmé: ${item.phone}`); }
-          else { u.stats.missing++; ulog(u,'warn',`  ⚠ Manuel: ${item.phone} — ${confirmResult.err}`); }
+          else { u.stats.missing++; ulog(u,'warn',`  △ Manuel: ${item.phone} — ${confirmResult.err}`); }
         }
         await sleep(700);
       }
@@ -455,7 +519,7 @@ function stopPolling(u) {
   u.botActive=false; ulog(u,'warn','Bot arrêté');
 }
 
-// ── CSS partagé ───────────────────────────────────────────────
+// — CSS partagé ——————————————————————————————
 const CSS_COMMON = `
 :root{--bg:#0d1117;--s1:#161b22;--s2:#21262d;--s3:#30363d;--t:#e6edf3;--m:#8b949e;--g:#3fb950;--b:#58a6ff;--o:#f0883e;--r:#f85149;--p:#bc8cff}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -469,260 +533,239 @@ body{background:var(--bg);font-family:'Courier New',monospace;color:var(--t);fon
 label{font-size:9px;font-weight:700;letter-spacing:1.5px;color:var(--m);text-transform:uppercase}
 input,select,textarea{width:100%;background:var(--s2);border:1px solid var(--s3);color:var(--t);border-radius:6px;padding:8px 10px;font-family:inherit;font-size:12px;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--b)}
-.btn{padding:9px 18px;border-radius:7px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;border:none;text-decoration:none;display:inline-block}
-.btn-save{background:rgba(88,166,255,.15);color:var(--b);border:1px solid rgba(88,166,255,.4)}
-.btn-go{background:rgba(63,185,80,.2);color:var(--g);border:1px solid rgba(63,185,80,.4)}
-.btn-stop{background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.35)}
-.btn-gray{background:var(--s2);color:var(--m);border:1px solid var(--s3)}
-.btn-red{background:rgba(248,81,73,.8);color:#fff;border:none}
-.btn-purple{background:rgba(188,140,255,.8);color:#fff;border:none}
-.btn:hover{filter:brightness(1.15)}.btns{display:flex;gap:8px;flex-wrap:wrap}
-.statbar{display:flex;gap:8px;flex-wrap:wrap}
-.sc{background:var(--s1);border:1px solid var(--s3);border-radius:10px;padding:12px 20px;min-width:90px;text-align:center;flex:1}
-.sv{font-size:28px;font-weight:700;line-height:1}.sl{font-size:9px;color:var(--m);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
-.sc.vc .sv{color:var(--g)}.sc.vm .sv{color:var(--o)}.sc.vp .sv{color:var(--p)}.sc.vs .sv{color:var(--t)}.sc.vr .sv{color:var(--r)}
-.badge{display:inline-flex;align-items:center;gap:5px;border-radius:20px;padding:4px 12px;font-size:10px;font-weight:700}
-.badge .dot{width:7px;height:7px;border-radius:50%}
-.b-on{background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3)}
-.b-on .dot{background:var(--g);animation:pulse 1.8s infinite}
-.b-off{background:rgba(139,148,158,.1);color:var(--m);border:1px solid rgba(139,148,158,.2)}
-.b-off .dot{background:var(--m)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.log{background:#0d1117;border-radius:7px;max-height:400px;overflow-y:auto;padding:8px;font-size:10px;line-height:1.9;word-break:break-word}
-.le{display:flex;gap:10px}.lt{color:var(--m);min-width:135px;flex-shrink:0}
-.ok span:last-child{color:var(--g)}.er span:last-child{color:var(--r)}.wa span:last-child{color:var(--o)}.in span:last-child{color:var(--b)}
-.tag-ok{display:inline-block;background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
-.tag-err{display:inline-block;background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
-.tbl{width:100%;border-collapse:collapse;font-size:11px}
-.tbl th{background:var(--s2);padding:7px;text-align:left;color:var(--b)}
-.tbl td{padding:6px 7px;border-bottom:1px solid var(--s3)}
-.seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
+btn{display:inline-block;padding:9px 18px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:1px;cursor:pointer;border:none;text-decoration:none;text-transform:uppercase}
+.bg{background:var(--g);color:#000}.bb{background:var(--b);color:#000}.br{background:var(--r);color:#fff}.bo{background:var(--o);color:#000}.bp{background:var(--p);color:#000}
+.stat{background:var(--s2);border-radius:8px;padding:14px;text-align:center}
+.sv{font-size:22px;font-weight:700;color:var(--g)}.sl{font-size:10px;color:var(--m);margin-top:4px}
+.log-box{height:260px;overflow-y:auto;background:var(--s2);border-radius:6px;padding:10px;font-size:11px;line-height:1.6}
+.log-ok{color:var(--g)}.log-err{color:var(--r)}.log-warn{color:var(--o)}.log-info{color:var(--b)}
+.badge{display:inline-block;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700}
+.b-on{background:#1a4731;color:var(--g)}.b-off{background:#3d1a1a;color:var(--r)}
+nav{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+nav a{color:var(--b);text-decoration:none;font-size:11px;font-weight:700;letter-spacing:1px;padding:4px 0;border-bottom:2px solid transparent}
+nav a.active{border-color:var(--b);color:var(--t)}
+.alert{padding:10px 14px;border-radius:6px;font-size:12px;margin-bottom:12px}
+.a-ok{background:#1a4731;border:1px solid var(--g);color:var(--g)}.a-err{background:#3d1a1a;border:1px solid var(--r);color:var(--r)}
 `;
 
-// ── Page login ────────────────────────────────────────────────
-function loginPage(err='') {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-F</title>
-<style>${CSS_COMMON}
-.box{max-width:380px;margin:80px auto;background:var(--s1);border:1px solid var(--s3);border-radius:12px;padding:28px}
-h1{color:var(--p);font-size:1.2rem;margin-bottom:20px;text-align:center}
-</style></head><body><div class="box">
-<h1>🤖 YapsonBot7-F</h1>
-${err?`<div style="color:var(--r);font-size:11px;margin-bottom:10px">✘ ${err}</div>`:''}
-<form method="POST" action="/login">
-<div class="frow"><label>Utilisateur</label><input type="text" name="username" required></div>
-<div class="frow"><label>Mot de passe</label><input type="password" name="password" required></div>
-<button class="btn btn-go" style="width:100%;margin-top:8px">Connexion</button>
-</form></div></body></html>`;
-}
+// — Routes HTML ——————————————————————————————
+app.get('/login', (req,res)=>{
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Bot7-F Login</title><style>${CSS_COMMON}
+  .login-box{max-width:380px;margin:60px auto}h1{font-size:18px;color:var(--b);margin-bottom:20px;text-align:center}
+  </style></head><body><div class="login-box"><div class="card">
+  <div class="ch">🤖 YAPSON BOT7-F — CONNEXION</div><div class="cb">
+  <h1>Accès Bot</h1>
+  ${req.query.err?`<div class="alert a-err">Identifiants incorrects</div>`:''}
+  <form method="POST" action="/login">
+  <div class="frow"><label>Identifiant</label><input name="user" autofocus></div>
+  <div class="frow"><label>Mot de passe</label><input type="password" name="pass"></div>
+  <btn class="bg" type="submit" style="width:100%;margin-top:8px">CONNEXION</btn>
+  </form></div></div></div></body></html>`);
+});
 
-// ── Dashboard utilisateur ─────────────────────────────────────
-function userPage(u) {
-  const hasSession = parseCookies(u.cfg.mgmtCookies).length > 20;
-  const logHtml = u.logs.slice(0,120).map(e => {
-    const cls=e.type==='ok'?'ok':e.type==='err'?'er':e.type==='warn'?'wa':'in';
-    const ic=e.type==='ok'?'✔':e.type==='err'?'✘':e.type==='warn'?'⚠':'▸';
-    return `<div class="le ${cls}"><span class="lt">${e.ts}</span><span>${ic} ${e.msg}</span></div>`;
-  }).join('');
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-F — ${u.username}</title>
-<style>${CSS_COMMON}</style>
-<script>
-if (${JSON.stringify(u.botActive)}) setTimeout(()=>location.reload(), 15000);
-</script>
-</head><body><div class="wrap">
-
-<div style="display:flex;justify-content:space-between;align-items:center">
-  <div style="color:var(--p);font-weight:700;font-size:1.1rem">🤖 ${u.username}</div>
-  <a href="/logout" class="btn btn-gray" style="font-size:10px">Déconnexion</a>
-</div>
-
-<div class="statbar">
-<div class="sc vc"><div class="sv">${u.stats.confirmed}</div><div class="sl">Confirmés</div></div>
-<div class="sc vm"><div class="sv">${u.stats.missing}</div><div class="sl">Manquants</div></div>
-<div class="sc vp"><div class="sv">${u.stats.polls}</div><div class="sl">Polls</div></div>
-<div class="sc vr"><div class="sv">${u.stats.rejected}</div><div class="sl">Rejetés</div></div>
-</div>
-
-<div class="card"><div class="ch">🔑 COMPTES</div><div class="cb">
-<form method="POST" action="/user/save-accounts"><div class="g2">
-<div><div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
-<div class="frow"><label>Token Yapson</label>
-<input type="password" name="yapsonToken" value="${u.cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
-${u.cfg.yapsonToken?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
-</div></div>
-<div><div class="seclbl" style="color:var(--g)">my-managment.com</div>
-<div class="frow"><label>Cookies de session</label>
-<textarea name="mgmtCookies" rows="3" placeholder='[{"name":"auid",...}] ou PHPSESSID=...'></textarea>
-${hasSession?'<span class="tag-ok">✓ Session active</span>':'<span class="tag-err">✗ Requis</span>'}
-</div></div></div>
-<div style="margin-top:14px"><button class="btn btn-save">💾 Sauvegarder</button></div>
-</form></div></div>
-
-<div class="card"><div class="ch">⚙️ CONFIGURATION</div><div class="cb">
-<form method="POST" action="/user/save-config">
-<div class="frow"><div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-<span style="font-size:11px;color:var(--m)">Intervalle :</span>
-<input type="number" name="pollInterval" value="${u.cfg.pollInterval}" min="60" max="86400" style="width:90px">
-<span style="font-size:11px;color:var(--m)">s</span>
-<span style="font-size:11px;color:var(--m);margin-left:16px">Solde max :</span>
-<input type="number" name="maxSolde" value="${u.cfg.maxSolde}" min="0" style="width:120px">
-<span style="font-size:11px;color:var(--m)">FCFA (0=illimité)</span>
-</div></div>
-<div style="margin-top:14px"><button class="btn btn-save">💾 Appliquer</button></div>
-</form></div></div>
-
-<div class="card"><div class="ch">▶ CONTRÔLES</div><div class="cb">
-<span class="${u.botActive?'badge b-on':'badge b-off'}"><span class="dot"></span>${u.botActive?'Actif — toutes les '+u.cfg.pollInterval+'s':'Arrêté'}</span>
-<div class="btns" style="margin-top:14px">
-<a class="btn ${u.botActive?'btn-gray':'btn-go'}" href="/user/start">▶ Démarrer</a>
-<a class="btn ${u.botActive?'btn-stop':'btn-gray'}" href="/user/stop">■ Arrêter</a>
-<a class="btn btn-gray" href="/user/run">↻ Cycle manuel</a>
-<a class="btn btn-gray" href="/user/reset">◌ Reset stats</a>
-<a class="btn btn-gray" href="/dashboard">⟳ Actualiser</a>
-</div></div></div>
-
-<div class="card"><div class="ch">📋 JOURNAL — ${u.logs.length} entrées</div>
-<div class="cb" style="padding:8px"><div class="log">${logHtml||'<div class="le in"><span class="lt">—</span><span>▸ En attente</span></div>'}</div>
-</div></div>
-</div></body></html>`;
-}
-
-// ── Dashboard admin ───────────────────────────────────────────
-function adminPage(err='', ok='') {
-  const list = Object.values(users);
-  const rows = list.map(u=>`<tr>
-<td>${u.username}</td>
-<td><span style="color:${u.botActive?'var(--g)':'var(--m)'}">${u.botActive?'● Actif':'■ Arrêté'}</span></td>
-<td style="color:var(--g)">${u.stats.confirmed}</td>
-<td style="color:var(--o)">${u.stats.missing}</td>
-<td style="color:var(--r)">${u.stats.rejected}</td>
-<td>${parseCookies(u.cfg.mgmtCookies).length>20?'<span class="tag-ok">✓</span>':'<span class="tag-err">✗</span>'}</td>
-<td>${u.cfg.yapsonToken?'<span class="tag-ok">✓</span>':'<span class="tag-err">✗</span>'}</td>
-<td><form method="POST" action="/admin/delete-user" style="display:inline"><input type="hidden" name="userId" value="${u.id}"><button class="btn btn-red" style="font-size:10px;padding:3px 8px" onclick="return confirm('Supprimer ${u.username} ?')">Supprimer</button></form></td>
-</tr>`).join('');
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-F Admin</title>
-<style>${CSS_COMMON}</style></head><body><div class="wrap">
-
-<div style="display:flex;justify-content:space-between;align-items:center">
-  <div style="color:var(--p);font-weight:700;font-size:1.1rem">🛡 Administration — YapsonBot7-F</div>
-  <a href="/logout" class="btn btn-gray" style="font-size:10px">Déconnexion</a>
-</div>
-
-${err?`<div style="color:var(--r);font-size:11px">✘ ${err}</div>`:''}
-${ok?`<div style="color:var(--g);font-size:11px">✔ ${ok}</div>`:''}
-
-<div class="statbar">
-<div class="sc"><div class="sv" style="color:var(--p)">${list.length}</div><div class="sl">Utilisateurs</div></div>
-<div class="sc"><div class="sv" style="color:var(--g)">${list.filter(u=>u.botActive).length}</div><div class="sl">Actifs</div></div>
-<div class="sc vc"><div class="sv">${list.reduce((s,u)=>s+u.stats.confirmed,0)}</div><div class="sl">Confirmés total</div></div>
-<div class="sc vm"><div class="sv">${list.reduce((s,u)=>s+u.stats.missing,0)}</div><div class="sl">Manquants total</div></div>
-</div>
-
-<div class="card"><div class="ch">➕ CRÉER UN UTILISATEUR</div><div class="cb">
-<form method="POST" action="/admin/create-user">
-<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
-<div class="frow" style="margin:0;flex:1"><label>Nom d'utilisateur</label><input type="text" name="username" required style="width:auto"></div>
-<div class="frow" style="margin:0;flex:1"><label>Mot de passe</label><input type="password" name="password" required style="width:auto"></div>
-<button class="btn btn-purple">Créer</button>
-</div></form></div></div>
-
-<div class="card"><div class="ch">👥 UTILISATEURS (${list.length})</div><div class="cb">
-${list.length===0?'<div style="color:var(--m);font-size:11px">Aucun utilisateur créé.</div>':`
-<table class="tbl"><tr><th>Utilisateur</th><th>Statut</th><th>Confirmés</th><th>Manquants</th><th>Rejetés</th><th>Cookies</th><th>Token</th><th>Action</th></tr>
-${rows}</table>`}
-</div></div>
-
-<div class="card"><div class="ch">🔑 MOT DE PASSE ADMIN</div><div class="cb">
-<form method="POST" action="/admin/change-password">
-<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
-<div class="frow" style="margin:0;flex:1"><label>Ancien mot de passe</label><input type="password" name="oldPass" style="width:auto"></div>
-<div class="frow" style="margin:0;flex:1"><label>Nouveau mot de passe</label><input type="password" name="newPass" style="width:auto"></div>
-<button class="btn btn-save">Changer</button>
-</div></form></div></div>
-
-</div></body></html>`;
-}
-
-// ── Routes ────────────────────────────────────────────────────
-app.get('/login',  (req,res) => res.send(loginPage()));
-app.post('/login', (req,res) => {
-  const { username, password } = req.body;
-  if (username===ADMIN_USER && password===ADMIN_PASS) {
-    const tok = createSession('admin',true);
-    res.setHeader('Set-Cookie',`session=${tok}; HttpOnly; Path=/; Max-Age=28800`);
-    return res.redirect('/admin');
+app.post('/login', (req,res)=>{
+  const { user, pass } = req.body;
+  if (user === ADMIN_USER && pass === ADMIN_PASS) {
+    const token = createSession(user, true);
+    res.setHeader('Set-Cookie',`session=${token};HttpOnly;Path=/;Max-Age=28800`);
+    return res.redirect('/');
   }
-  const u = Object.values(users).find(u=>u.username===username && u.passwordHash===hashPass(password));
+  // Vérifier utilisateurs normaux
+  const u = Object.values(users).find(u => u.userId===user && u.cfg.password===pass);
   if (u) {
-    const tok = createSession(u.id,false);
-    res.setHeader('Set-Cookie',`session=${tok}; HttpOnly; Path=/; Max-Age=28800`);
-    return res.redirect('/dashboard');
+    const token = createSession(user, false);
+    res.setHeader('Set-Cookie',`session=${token};HttpOnly;Path=/;Max-Age=28800`);
+    return res.redirect('/bot');
   }
-  res.send(loginPage('Identifiants incorrects'));
-});
-app.get('/logout', (req,res) => { res.setHeader('Set-Cookie','session=; HttpOnly; Path=/; Max-Age=0'); res.redirect('/login'); });
-app.get('/', (req,res) => { const s=getSession(req); if(!s) return res.redirect('/login'); return s.isAdmin?res.redirect('/admin'):res.redirect('/dashboard'); });
-
-// Routes utilisateur
-function requireUser(req,res) { const s=getSession(req); if(!s||s.isAdmin) { res.redirect('/login'); return null; } const u=users[s.userId]; if(!u){res.redirect('/login');return null;} return u; }
-
-app.get('/dashboard', (req,res) => { const s=getSession(req); if(!s) return res.redirect('/login'); if(s.isAdmin) return res.redirect('/admin'); const u=users[s.userId]; if(!u) return res.redirect('/login'); res.send(userPage(u)); });
-
-app.post('/user/save-accounts', (req,res) => {
-  const s=getSession(req); if(!s||s.isAdmin) return res.redirect('/login');
-  const u=users[s.userId]; if(!u) return res.redirect('/login');
-  const{yapsonToken,mgmtCookies}=req.body;
-  if(yapsonToken&&!yapsonToken.startsWith('●')){u.cfg.yapsonToken=yapsonToken.trim();ulog(u,'ok','🔑 Token yapson mis à jour');}
-  if(mgmtCookies){const t=mgmtCookies.trim();const ok=t.startsWith('[')||/^[a-zA-Z_][a-zA-Z0-9_]*=/.test(t);const bad=t.includes('configuré')||t.includes('(coller')||t.startsWith('(');if(ok&&!bad){u.cfg.mgmtCookies=t;ulog(u,'ok',`🍪 Cookies mis à jour — ${parseCookies(t).split(';').length} cookie(s)`);}else if(bad){ulog(u,'warn','⚠ Cookies ignorés (placeholder)');}}
-  ulog(u,'ok','Comptes sauvegardés');
-  if(u.botActive){stopPolling(u);setTimeout(()=>startPolling(u),500);}
-  res.redirect('/dashboard');
-});
-app.post('/user/save-config', (req,res) => {
-  const s=getSession(req); if(!s||s.isAdmin) return res.redirect('/login');
-  const u=users[s.userId]; if(!u) return res.redirect('/login');
-  if(req.body.pollInterval) u.cfg.pollInterval=Math.max(60,parseInt(req.body.pollInterval));
-  if(req.body.maxSolde!==undefined) u.cfg.maxSolde=parseInt(req.body.maxSolde)||0;
-  ulog(u,'ok',`Config: intervalle=${u.cfg.pollInterval}s`);
-  if(u.botActive){stopPolling(u);setTimeout(()=>startPolling(u),500);}
-  res.redirect('/dashboard');
-});
-app.get('/user/start', (req,res) => { const s=getSession(req); if(!s||s.isAdmin) return res.redirect('/login'); const u=users[s.userId]; if(u) startPolling(u); res.redirect('/dashboard'); });
-app.get('/user/stop',  (req,res) => { const s=getSession(req); if(!s||s.isAdmin) return res.redirect('/login'); const u=users[s.userId]; if(u) stopPolling(u);  res.redirect('/dashboard'); });
-app.get('/user/run',   (req,res) => { const s=getSession(req); if(!s||s.isAdmin) return res.redirect('/login'); const u=users[s.userId]; if(u) runCycle(u).catch(e=>ulog(u,'err',e.message)); res.redirect('/dashboard'); });
-app.get('/user/reset', (req,res) => { const s=getSession(req); if(!s||s.isAdmin) return res.redirect('/login'); const u=users[s.userId]; if(u){Object.keys(u.stats).forEach(k=>u.stats[k]=0);u.logs.length=0;ulog(u,'info','Reset');} res.redirect('/dashboard'); });
-
-// Routes admin
-app.get('/admin', (req,res) => { const s=getSession(req); if(!s||!s.isAdmin) return res.redirect('/login'); res.send(adminPage()); });
-app.post('/admin/create-user', (req,res) => {
-  const s=getSession(req); if(!s||!s.isAdmin) return res.redirect('/login');
-  const{username,password}=req.body;
-  if(!username||!password) return res.send(adminPage('Nom et mot de passe requis'));
-  if(Object.values(users).find(u=>u.username===username.trim())) return res.send(adminPage(`"${username}" existe déjà`));
-  createUser(username.trim(),password.trim());
-  res.send(adminPage('',`Utilisateur "${username}" créé ✔`));
-});
-app.post('/admin/delete-user', (req,res) => {
-  const s=getSession(req); if(!s||!s.isAdmin) return res.redirect('/login');
-  const u=users[req.body.userId]; if(!u) return res.send(adminPage('Introuvable'));
-  const name=u.username; stopPolling(u); delete users[req.body.userId];
-  res.send(adminPage('',`"${name}" supprimé ✔`));
-});
-app.post('/admin/change-password', (req,res) => {
-  const s=getSession(req); if(!s||!s.isAdmin) return res.redirect('/login');
-  const{oldPass,newPass}=req.body;
-  if(oldPass!==ADMIN_PASS) return res.send(adminPage('Ancien mot de passe incorrect'));
-  if(!newPass||newPass.length<4) return res.send(adminPage('Mot de passe trop court (min 4 caractères)'));
-  ADMIN_PASS=newPass;
-  res.send(adminPage('','Mot de passe admin changé ✔'));
+  res.redirect('/login?err=1');
 });
 
-app.get('/health',(req,res) => {
-  const s=getSession(req);
-  if(!s) return res.status(401).json({error:'Non autorisé'});
-  if(s.isAdmin) return res.json({users:Object.values(users).map(u=>({username:u.username,botActive:u.botActive,confirmed:u.stats.confirmed,missing:u.stats.missing}))});
-  const u=users[s.userId]; return u?res.json({...u.stats,botActive:u.botActive}):res.status(404).json({error:'Introuvable'});
+app.get('/logout', (req,res)=>{
+  const m = (req.headers.cookie||'').match(/session=([a-f0-9]{64})/);
+  if (m) delete sessions[m[1]];
+  res.setHeader('Set-Cookie','session=;HttpOnly;Path=/;Max-Age=0');
+  res.redirect('/login');
 });
 
-app.listen(PORT, () => {
-  console.log(`YapsonBot7-F multi-users — port ${PORT} | Admin: ${ADMIN_USER}`);
+// — Page admin principale ————————————————————
+app.get('/', requireAdmin, (req,res)=>{
+  const allU = getAllUsers();
+  const rows = allU.map(u=>`
+    <tr>
+      <td>${u.userId}</td>
+      <td><span class="badge ${u.botActive?'b-on':'b-off'}">${u.botActive?'ACTIF':'ARRÊTÉ'}</span></td>
+      <td>${u.stats?.confirmed||0}</td>
+      <td>${u.stats?.missing||0}</td>
+      <td>${u.cfg.pollInterval}s</td>
+      <td><a href="/admin/user/${u.userId}" class="btn bb" style="font-size:10px;padding:4px 10px">Gérer</a></td>
+    </tr>`).join('');
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Admin Bot7-F</title><style>${CSS_COMMON}
+  table{width:100%;border-collapse:collapse}th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--s3);font-size:12px}
+  th{font-size:10px;font-weight:700;letter-spacing:1px;color:var(--m);text-transform:uppercase}
+  </style></head><body><div class="wrap">
+  <div class="card"><div class="ch">⚙️ ADMIN — BOT7-F
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <a href="/admin/new" class="btn bg">+ Ajouter Utilisateur</a>
+      <a href="/logout" class="btn br">Déconnexion</a>
+    </div>
+  </div><div class="cb">
+  <div style="display:flex;gap:12px;margin-bottom:16px">
+    <div class="stat"><div class="sv">${allU.length}</div><div class="sl">Utilisateurs</div></div>
+    <div class="stat"><div class="sv" style="color:var(--g)">${allU.filter(u=>u.botActive).length}</div><div class="sl">Actifs</div></div>
+    <div class="stat"><div class="sv" style="color:var(--b)">${allU.reduce((s,u)=>s+(u.stats?.confirmed||0),0)}</div><div class="sl">Confirmés total</div></div>
+  </div>
+  <table><thead><tr><th>Utilisateur</th><th>Statut</th><th>Confirmés</th><th>Manqués</th><th>Intervalle</th><th>Action</th></tr></thead>
+  <tbody>${rows||'<tr><td colspan="6" style="text-align:center;color:var(--m)">Aucun utilisateur</td></tr>'}</tbody></table>
+  </div></div></div></body></html>`);
+});
+
+// — Créer un utilisateur ———————————————————
+app.get('/admin/new', requireAdmin, (req,res)=>{
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Nouvel utilisateur</title><style>${CSS_COMMON}</style></head>
+  <body><div class="wrap"><div class="card"><div class="ch">➕ NOUVEL UTILISATEUR <a href="/" style="margin-left:auto;color:var(--m);font-size:10px">← Retour</a></div>
+  <div class="cb"><form method="POST" action="/admin/new">
+  <div class="g2">
+    <div class="frow"><label>Identifiant</label><input name="userId" required></div>
+    <div class="frow"><label>Mot de passe</label><input type="password" name="password" required></div>
+    <div class="frow"><label>Token Yapson</label><input name="yapToken" required></div>
+    <div class="frow"><label>Report ID (mgmt)</label><input name="reportId" value="1"></div>
+    <div class="frow"><label>Intervalle poll (s)</label><input name="pollInterval" type="number" value="60" min="20"></div>
+    <div class="frow"><label>Auto-démarrer</label><select name="autoStart"><option value="0">Non</option><option value="1">Oui</option></select></div>
+  </div>
+  <div class="frow"><label>Cookies my-managment.com</label><textarea name="mgmtCookies" rows="4" placeholder="Collez vos cookies ici..."></textarea></div>
+  <btn class="bg" type="submit" style="margin-top:8px">CRÉER</btn>
+  </form></div></div></div></body></html>`);
+});
+
+app.post('/admin/new', requireAdmin, (req,res)=>{
+  const { userId, password, yapToken, reportId, pollInterval, autoStart, mgmtCookies } = req.body;
+  if (!userId||!password||!yapToken) return res.redirect('/admin/new?err=1');
+  const u = {
+    userId, botActive:false, isRunning:false, pollTimer:null,
+    logs:[], stats:{ confirmed:0, missing:0, rejected:0 },
+    cfg:{ password, yapToken, reportId:reportId||'1', pollInterval:parseInt(pollInterval||60,10), mgmtCookies:mgmtCookies||'', getHeaders:()=>({}) },
+  };
+  saveUser(u);
+  if (autoStart==='1') startPolling(u);
+  res.redirect('/');
+});
+
+// — Gérer un utilisateur ———————————————————
+app.get('/admin/user/:id', requireAdmin, (req,res)=>{
+  const u = getUser(req.params.id);
+  if (!u) return res.redirect('/');
+  const logs = [...u.logs].reverse().slice(0,80).map(l=>`<div class="log-${l.type}">[${l.ts}] ${escHtml(l.message)}</div>`).join('');
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Utilisateur ${u.userId}</title><style>${CSS_COMMON}</style>
+  <script>function confirmDel(){return confirm('Supprimer cet utilisateur ?')}</script>
+  </head><body><div class="wrap">
+  <div class="card"><div class="ch">👤 ${u.userId} — <span class="badge ${u.botActive?'b-on':'b-off'}">${u.botActive?'ACTIF':'ARRÊTÉ'}</span>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <a href="/" style="color:var(--m);font-size:10px">← Admin</a>
+    </div>
+  </div><div class="cb">
+  <div class="g2" style="margin-bottom:16px">
+    <div class="stat"><div class="sv">${u.stats?.confirmed||0}</div><div class="sl">Confirmés</div></div>
+    <div class="stat"><div class="sv" style="color:var(--r)">${u.stats?.missing||0}</div><div class="sl">Manqués</div></div>
+  </div>
+  <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+    ${!u.botActive?`<form method="POST" action="/admin/user/${u.userId}/start"><btn class="bg" type="submit">▶ Démarrer</btn></form>`
+                  :`<form method="POST" action="/admin/user/${u.userId}/stop"><btn class="br" type="submit">⏹ Arrêter</btn></form>`}
+    <form method="POST" action="/admin/user/${u.userId}/delete" onsubmit="return confirmDel()"><btn class="br" type="submit">🗑 Supprimer</btn></form>
+  </div>
+  <div class="card"><div class="ch">📋 Logs récents</div><div class="cb">
+    <div class="log-box">${logs||'<div class="log-info">Aucun log</div>'}</div>
+  </div></div>
+  <div class="card" style="margin-top:12px"><div class="ch">✏️ Modifier config</div><div class="cb">
+  <form method="POST" action="/admin/user/${u.userId}/update">
+  <div class="g2">
+    <div class="frow"><label>Token Yapson</label><input name="yapToken" value="${escHtml(u.cfg.yapToken)}"></div>
+    <div class="frow"><label>Report ID</label><input name="reportId" value="${escHtml(u.cfg.reportId)}"></div>
+    <div class="frow"><label>Intervalle (s)</label><input name="pollInterval" type="number" value="${u.cfg.pollInterval}" min="20"></div>
+    <div class="frow"><label>Nouveau mot de passe</label><input type="password" name="password" placeholder="Laisser vide = inchangé"></div>
+  </div>
+  <div class="frow"><label>Cookies my-managment</label><textarea name="mgmtCookies" rows="4">${escHtml(u.cfg.mgmtCookies)}</textarea></div>
+  <btn class="bb" type="submit" style="margin-top:8px">💾 Enregistrer</btn>
+  </form></div></div>
+  </div></div></div></body></html>`);
+});
+
+app.post('/admin/user/:id/start', requireAdmin, (req,res)=>{
+  const u = getUser(req.params.id); if(!u) return res.redirect('/');
+  startPolling(u); res.redirect(`/admin/user/${u.userId}`);
+});
+app.post('/admin/user/:id/stop', requireAdmin, (req,res)=>{
+  const u = getUser(req.params.id); if(!u) return res.redirect('/');
+  stopPolling(u); res.redirect(`/admin/user/${u.userId}`);
+});
+app.post('/admin/user/:id/delete', requireAdmin, (req,res)=>{
+  const u = getUser(req.params.id); if(!u) return res.redirect('/');
+  stopPolling(u); delete users[u.userId]; res.redirect('/');
+});
+app.post('/admin/user/:id/update', requireAdmin, (req,res)=>{
+  const u = getUser(req.params.id); if(!u) return res.redirect('/');
+  const { yapToken, reportId, pollInterval, mgmtCookies, password } = req.body;
+  if (yapToken)    u.cfg.yapToken     = yapToken;
+  if (reportId)    u.cfg.reportId     = reportId;
+  if (pollInterval)u.cfg.pollInterval = parseInt(pollInterval,10);
+  if (mgmtCookies !== undefined) u.cfg.mgmtCookies = mgmtCookies;
+  if (password)    u.cfg.password     = password;
+  res.redirect(`/admin/user/${u.userId}`);
+});
+
+// — Page bot utilisateur ———————————————————
+app.get('/bot', requireLogin, (req,res)=>{
+  const u = getUser(req.session.userId);
+  if (!u) return res.redirect('/login');
+  if (req.session.isAdmin) return res.redirect('/');
+  const logs = [...u.logs].reverse().slice(0,60).map(l=>`<div class="log-${l.type}">[${l.ts}] ${escHtml(l.message)}</div>`).join('');
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Bot — ${u.userId}</title>
+  <meta http-equiv="refresh" content="15"><style>${CSS_COMMON}</style></head>
+  <body><div class="wrap">
+  <div class="card"><div class="ch">🤖 BOT — ${u.userId}
+    <span class="badge ${u.botActive?'b-on':'b-off'}" style="margin-left:8px">${u.botActive?'ACTIF':'ARRÊTÉ'}</span>
+    <a href="/logout" style="margin-left:auto;color:var(--m);font-size:10px">Déconnexion</a>
+  </div><div class="cb">
+  <div class="g2" style="margin-bottom:16px">
+    <div class="stat"><div class="sv">${u.stats?.confirmed||0}</div><div class="sl">Confirmés</div></div>
+    <div class="stat"><div class="sv" style="color:var(--r)">${u.stats?.missing||0}</div><div class="sl">Manqués</div></div>
+  </div>
+  ${!u.botActive
+    ?`<form method="POST" action="/bot/start"><btn class="bg" type="submit">▶ Démarrer le Bot</btn></form>`
+    :`<form method="POST" action="/bot/stop"><btn class="br" type="submit">⏹ Arrêter le Bot</btn></form>`}
+  </div></div>
+  <div class="card"><div class="ch">📋 Activité</div><div class="cb">
+    <div class="log-box">${logs||'<div class="log-info">En attente de démarrage...</div>'}</div>
+  </div></div>
+  </div></body></html>`);
+});
+
+app.post('/bot/start', requireLogin, (req,res)=>{
+  const u = getUser(req.session.userId); if(!u) return res.redirect('/login');
+  startPolling(u); res.redirect('/bot');
+});
+app.post('/bot/stop', requireLogin, (req,res)=>{
+  const u = getUser(req.session.userId); if(!u) return res.redirect('/login');
+  stopPolling(u); res.redirect('/bot');
+});
+
+// — API admin (JSON) ———————————————————————
+app.get('/api/admin/pass', requireAdmin, (req,res)=>{
+  res.json({ user: ADMIN_USER });
+});
+app.post('/api/admin/pass', requireAdmin, (req,res)=>{
+  const { newUser, newPass } = req.body;
+  if (newUser) ADMIN_USER = newUser;
+  if (newPass) ADMIN_PASS = newPass;
+  res.json({ ok:true });
+});
+
+// — Helpers ————————————————————————————————
+function escHtml(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// — Démarrage ——————————————————————————————
+app.listen(PORT, ()=>{
+  console.log(`✅ Bot7-F démarré sur le port ${PORT}`);
+  console.log(`   Admin: ${ADMIN_USER} / [ADMIN_PASS]`);
 });

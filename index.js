@@ -533,7 +533,7 @@ body{background:var(--bg);font-family:'Courier New',monospace;color:var(--t);fon
 label{font-size:9px;font-weight:700;letter-spacing:1.5px;color:var(--m);text-transform:uppercase}
 input,select,textarea{width:100%;background:var(--s2);border:1px solid var(--s3);color:var(--t);border-radius:6px;padding:8px 10px;font-family:inherit;font-size:12px;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--b)}
-btn{display:inline-block;padding:9px 18px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:1px;cursor:pointer;border:none;text-decoration:none;text-transform:uppercase}
+button{display:inline-block;padding:9px 18px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:1px;cursor:pointer;border:none;text-decoration:none;text-transform:uppercase}
 .bg{background:var(--g);color:#000}.bb{background:var(--b);color:#000}.br{background:var(--r);color:#fff}.bo{background:var(--o);color:#000}.bp{background:var(--p);color:#000}
 .stat{background:var(--s2);border-radius:8px;padding:14px;text-align:center}
 .sv{font-size:22px;font-weight:700;color:var(--g)}.sl{font-size:10px;color:var(--m);margin-top:4px}
@@ -559,7 +559,7 @@ app.get('/login', (req,res)=>{
   <form method="POST" action="/login">
   <div class="frow"><label>Identifiant</label><input name="user" autofocus></div>
   <div class="frow"><label>Mot de passe</label><input type="password" name="pass"></div>
-  <btn class="bg" type="submit" style="width:100%;margin-top:8px">CONNEXION</btn>
+  <button class="bg" type="submit" style="width:100%;margin-top:8px">CONNEXION</button>
   </form></div></div></div></body></html>`);
 });
 
@@ -633,7 +633,7 @@ app.get('/admin/new', requireAdmin, (req,res)=>{
     <div class="frow"><label>Auto-démarrer</label><select name="autoStart"><option value="0">Non</option><option value="1">Oui</option></select></div>
   </div>
   <div class="frow"><label>Cookies my-managment.com</label><textarea name="mgmtCookies" rows="4" placeholder="Collez vos cookies ici..."></textarea></div>
-  <btn class="bg" type="submit" style="margin-top:8px">CRÉER</btn>
+  <button class="bg" type="submit" style="margin-top:8px">CRÉER</button>
   </form></div></div></div></body></html>`);
 });
 
@@ -668,9 +668,9 @@ app.get('/admin/user/:id', requireAdmin, (req,res)=>{
     <div class="stat"><div class="sv" style="color:var(--r)">${u.stats?.missing||0}</div><div class="sl">Manqués</div></div>
   </div>
   <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
-    ${!u.botActive?`<form method="POST" action="/admin/user/${u.userId}/start"><btn class="bg" type="submit">▶ Démarrer</btn></form>`
-                  :`<form method="POST" action="/admin/user/${u.userId}/stop"><btn class="br" type="submit">⏹ Arrêter</btn></form>`}
-    <form method="POST" action="/admin/user/${u.userId}/delete" onsubmit="return confirmDel()"><btn class="br" type="submit">🗑 Supprimer</btn></form>
+    ${!u.botActive?`<form method="POST" action="/admin/user/${u.userId}/start"><button class="bg" type="submit">▶ Démarrer</button></form>`
+                  :`<form method="POST" action="/admin/user/${u.userId}/stop"><button class="br" type="submit">⏹ Arrêter</button></form>`}
+    <form method="POST" action="/admin/user/${u.userId}/delete" onsubmit="return confirmDel()"><button class="br" type="submit">🗑 Supprimer</button></form>
   </div>
   <div class="card"><div class="ch">📋 Logs récents</div><div class="cb">
     <div class="log-box">${logs||'<div class="log-info">Aucun log</div>'}</div>
@@ -684,7 +684,7 @@ app.get('/admin/user/:id', requireAdmin, (req,res)=>{
     <div class="frow"><label>Nouveau mot de passe</label><input type="password" name="password" placeholder="Laisser vide = inchangé"></div>
   </div>
   <div class="frow"><label>Cookies my-managment</label><textarea name="mgmtCookies" rows="4">${escHtml(u.cfg.mgmtCookies)}</textarea></div>
-  <btn class="bb" type="submit" style="margin-top:8px">💾 Enregistrer</btn>
+  <button class="bb" type="submit" style="margin-top:8px">💾 Enregistrer</button>
   </form></div></div>
   </div></div></div></body></html>`);
 });
@@ -730,8 +730,8 @@ app.get('/bot', requireLogin, (req,res)=>{
     <div class="stat"><div class="sv" style="color:var(--r)">${u.stats?.missing||0}</div><div class="sl">Manqués</div></div>
   </div>
   ${!u.botActive
-    ?`<form method="POST" action="/bot/start"><btn class="bg" type="submit">▶ Démarrer le Bot</btn></form>`
-    :`<form method="POST" action="/bot/stop"><btn class="br" type="submit">⏹ Arrêter le Bot</btn></form>`}
+    ?`<form method="POST" action="/bot/start"><button class="bg" type="submit">▶ Démarrer le Bot</button></form>`
+    :`<form method="POST" action="/bot/stop"><button class="br" type="submit">⏹ Arrêter le Bot</button></form>`}
   </div></div>
   <div class="card"><div class="ch">📋 Activité</div><div class="cb">
     <div class="log-box">${logs||'<div class="log-info">En attente de démarrage...</div>'}</div>

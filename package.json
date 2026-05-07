@@ -1,6 +1,7 @@
 {
-  "name": "yapson-bot7-f",
+  "name": "yapson-bot7f",
   "version": "1.0.0",
+  "description": "YapsonBot7-F — Multi-utilisateurs, décaissement avec capture",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +10,6 @@
     "express": "^4.18.2",
     "node-fetch": "^2.7.0",
     "form-data": "^4.0.0",
-    "@napi-rs/canvas": "^0.1.55"
+    "pngjs": "^7.0.0"
   }
 }
